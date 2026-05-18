@@ -31,12 +31,17 @@ import { commitFile, git, initGitRepo, stageFile } from '../hook/git-test-helper
 const VALID_TOKEN = 'integration-test-token';
 const TEST_ORG = 'my-org';
 const TEST_PROJECT = 'my-project';
+// sonar-ignore-next-line
+const GITHUB_TEST_TOKEN = 'ghp_ABCDEFGHIJKLMNOPQRSTUVWXYZabcdef1234';
+const EXIT_CODE_SECRETS_FOUND = 51;
 
 describe('analyze (no subcommand)', () => {
   let harness: TestHarness;
 
   beforeEach(async () => {
     harness = await TestHarness.create();
+    initGitRepo(harness.cwd.path);
+    commitFile(harness.cwd.path, '.gitignore', '.claude/\n');
   });
 
   afterEach(async () => {
@@ -44,14 +49,114 @@ describe('analyze (no subcommand)', () => {
   });
 
   it(
-    'exits with code 0 and displays help with subcommands listed',
+    'exits with code 1 and prompts to authenticate when no active connection',
     async () => {
       const result = await harness.run('analyze');
 
-      expect(result.exitCode).toBe(0);
+      expect(result.exitCode).toBe(1);
       const output = result.stdout + result.stderr;
-      expect(output).toContain('secrets');
-      expect(output).toContain('agentic');
+      expect(output).toContain('❌ Not authenticated.');
+      expect(output).toContain("💡 Run 'sonar auth login' to authenticate.");
+    },
+    { timeout: 15000 },
+  );
+
+  it(
+    'runs secrets scan then agentic analysis on the change set',
+    async () => {
+      const server = await harness
+        .newFakeServer()
+        .withAuthToken(VALID_TOKEN)
+        .withSqaaResponse({ issues: [] })
+        .start();
+
+      harness
+        .state()
+        .withSecretsBinaryInstalled()
+        .withAuth(server.baseUrl(), VALID_TOKEN, TEST_ORG)
+        .withSqaaExtension(harness.cwd.path, TEST_PROJECT, TEST_ORG, server.baseUrl());
+
+      commitFile(harness.cwd.path, 'README.md', 'hello');
+      harness.cwd.writeFile('new.ts', 'const x = 1;');
+
+      const result = await harness.run('analyze', {
+        extraEnv: { SONAR_SECRETS_ALLOW_UNSECURE_HTTP: 'true' },
+      });
+
+      expect(result.exitCode).toBe(0);
+      expect(result.stdout + result.stderr).toContain('change set is clean');
+      const sqaaCalls = server
+        .getRecordedRequests()
+        .filter((r) => r.path === '/a3s-analysis/analyses');
+      expect(sqaaCalls).toHaveLength(1);
+    },
+    { timeout: 15000 },
+  );
+
+  it(
+    'outputs combined JSON report with secrets and agentic results',
+    async () => {
+      const server = await harness
+        .newFakeServer()
+        .withAuthToken(VALID_TOKEN)
+        .withSqaaResponse({ issues: [] })
+        .start();
+
+      harness
+        .state()
+        .withSecretsBinaryInstalled()
+        .withAuth(server.baseUrl(), VALID_TOKEN, TEST_ORG)
+        .withSqaaExtension(harness.cwd.path, TEST_PROJECT, TEST_ORG, server.baseUrl());
+
+      commitFile(harness.cwd.path, 'README.md', 'hello');
+      harness.cwd.writeFile('new.ts', 'const x = 1;');
+
+      const result = await harness.run('analyze --format json', {
+        extraEnv: { SONAR_SECRETS_ALLOW_UNSECURE_HTTP: 'true' },
+      });
+
+      expect(result.exitCode).toBe(0);
+      const report = JSON.parse(result.stdout) as {
+        secrets: { issues: unknown[]; summary: { totalIssues: number } };
+        agentic: { summary: { totalIssues: number } } | null;
+      };
+      expect(report.secrets.issues).toHaveLength(0);
+      expect(report.secrets.summary.totalIssues).toBe(0);
+      expect(report.agentic).not.toBeNull();
+      expect(report.agentic?.summary.totalIssues).toBe(0);
+    },
+    { timeout: 15000 },
+  );
+
+  it(
+    'outputs combined JSON report with agentic null when secrets finds a secret',
+    async () => {
+      const server = await harness
+        .newFakeServer()
+        .withAuthToken(VALID_TOKEN)
+        .withSqaaResponse({ issues: [] })
+        .start();
+
+      harness
+        .state()
+        .withSecretsBinaryInstalled()
+        .withAuth(server.baseUrl(), VALID_TOKEN, TEST_ORG)
+        .withSqaaExtension(harness.cwd.path, TEST_PROJECT, TEST_ORG, server.baseUrl());
+
+      commitFile(harness.cwd.path, 'README.md', 'hello');
+      harness.cwd.writeFile('leaked.ts', `const token = "${GITHUB_TEST_TOKEN}";`);
+
+      const result = await harness.run('analyze --format json', {
+        extraEnv: { SONAR_SECRETS_ALLOW_UNSECURE_HTTP: 'true' },
+      });
+
+      expect(result.exitCode).toBe(EXIT_CODE_SECRETS_FOUND);
+      const report = JSON.parse(result.stdout) as {
+        secrets: { issues: unknown[]; summary: { totalIssues: number } };
+        agentic: null;
+      };
+      expect(report.secrets.summary.totalIssues).toBeGreaterThan(0);
+      expect(report.agentic).toBeNull();
     },
     { timeout: 15000 },
   );
@@ -818,6 +923,8 @@ describe('verify — change-set mode (no --file)', () => {
 
       expect(result.exitCode).toBe(0);
       expect(result.stdout + result.stderr).toContain('change set is clean');
+      expect(result.stderr).toContain('deprecated');
+      expect(result.stderr).toContain('sonar analyze');
       const sqaaCalls = server
         .getRecordedRequests()
         .filter((r) => r.path === '/a3s-analysis/analyses');
