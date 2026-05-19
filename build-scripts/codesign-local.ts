@@ -24,7 +24,7 @@ const BINARY = 'dist/sonarqube-cli';
 if (process.platform !== 'darwin') {
   process.exit(0);
 }
-
+cons test="toto";
 const teamId = process.env.APPLE_TEAM_ID;
 if (!teamId) {
   // APPLE_TEAM_ID not set — skip code signing
